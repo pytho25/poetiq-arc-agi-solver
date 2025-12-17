@@ -281,9 +281,8 @@ class ARCTUIApp(App):
 
     /* Compact buttons */
     Button {
-        min-width: 8;
-        height: 1;
-        padding: 0 1;
+        min-width: 6;
+        height: 3;
         margin: 0;
     }
 
