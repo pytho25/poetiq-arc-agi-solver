@@ -11,6 +11,28 @@ from arc_agi.types import Models
 # Silence unnecessary litellm logs.
 litellm.suppress_debug_info = True
 
+# Register custom vLLM model with its context window size
+litellm.register_model({
+    "hosted_vllm/mistralai/Devstral-Small-2-24B-Instruct-2512": {
+        "max_tokens": 90000,
+        "max_input_tokens": 90000,
+        "max_output_tokens": 45000,
+        "input_cost_per_token": 0,
+        "output_cost_per_token": 0,
+    }
+})
+
+# Register OpenRouter Devstral model
+litellm.register_model({
+    "openrouter/mistralai/devstral-small-2505": {
+        "max_tokens": 90000,
+        "max_input_tokens": 90000,
+        "max_output_tokens": 45000,
+        "input_cost_per_token": 0,
+        "output_cost_per_token": 0,
+    }
+})
+
 RETRIES = 3
 RETRY_DELAY_SEC = 5
 
@@ -24,6 +46,8 @@ limiters: dict[Models, Limiter] = {
     "anthropic/claude-haiku-4-5": Limiter(1.0),
     "gemini/gemini-2.5-pro": Limiter(2.0),
     "gemini/gemini-3-pro-preview": Limiter(1.0),
+    "hosted_vllm/mistralai/Devstral-Small-2-24B-Instruct-2512": Limiter(100.0),
+    "openrouter/mistralai/devstral-small-2505": Limiter(1.0),
 }
 
 props: dict[Models, dict] = {
@@ -36,6 +60,8 @@ props: dict[Models, dict] = {
     "anthropic/claude-haiku-4-5": {"thinking": {"type": "enabled", "budget_tokens": 32_000}},
     "gemini/gemini-2.5-pro": {"thinking": {"type": "enabled", "budget_tokens": 16_000}},
     "gemini/gemini-3-pro-preview": {},
+    "hosted_vllm/mistralai/Devstral-Small-2-24B-Instruct-2512": {},
+    "openrouter/mistralai/devstral-small-2505": {},
 }
 
 

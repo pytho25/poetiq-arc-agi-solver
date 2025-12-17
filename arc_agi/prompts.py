@@ -371,3 +371,257 @@ Following are some of the best, though not completely correct, solutions so far.
 
 $$feedback$$
 '''
+
+# Warmup prompts for progressive understanding of puzzle transformations
+WARMUP_EXPLAIN_PROMPT = '''## SYSTEM ROLE
+
+You are a deterministic reasoning engine.
+- Follow instructions literally.
+- Do not infer unstated rules.
+- Do not add commentary outside the required format.
+
+---
+
+## Task
+
+Analyze the following grid-based transformation and infer the rule that converts the Input grid into the Output grid.
+
+This is similar to an ARC task.
+Base all reasoning only on observable properties.
+
+---
+
+## Definitions (MANDATORY)
+
+- A **cell** is one position in the grid.
+- An **object** is a set of orthogonally connected (up, down, left, right) non-zero cells of the same value.
+- **Background** is value 0.
+- **Color/value** refers to the integer value in each cell.
+- **Left** and **Right** are defined relative to grid columns.
+
+Use these definitions exactly.
+
+---
+
+## Input
+$$input$$
+
+## Output
+$$output$$
+
+---
+
+## REQUIRED RESPONSE FORMAT
+
+Respond using ONLY the following sections.
+- Do NOT change section names.
+- Do NOT reorder sections.
+- Do NOT add extra sections.
+
+---
+
+### Transformation Description
+
+Describe the transformation rule in precise, implementation-ready terms.
+
+**You MUST include:**
+- How objects are detected
+- How many object groups exist
+- How object groups are distinguished (position, size, shape, region)
+- Exact color/value mappings
+- Whether transformation is per-object or global
+
+Use clear, literal language.
+
+---
+
+### Mermaid Diagram
+
+Create a fully explicit flowchart describing the algorithm.
+
+**REQUIREMENTS:**
+- Use `flowchart TD` format
+- Subgraphs for each major phase: Detection, Classification, Transformation, Output
+- Diamond-shaped decision nodes `{condition?}` for ALL conditional logic
+- Explicit object detection logic
+- Explicit decision conditions
+- Explicit value/color mappings
+- Explicit output construction
+- A subgraph for `⚠️ Uncertainties` with dashed connections `-.->` from uncertain decision nodes
+- A subgraph for `❓ Open Questions` with dashed connections from unresolved logic
+
+---
+
+### Consistent Patterns
+
+List only directly observable patterns from this example:
+- Bounding boxes with approximate coordinates
+- Repeated shapes
+- Stable color mappings
+- Clear spatial separation rules
+
+Use bullet points.
+
+---
+
+### Inconsistencies
+
+If none exist for this first example, write:
+
+> None observed in this example.
+
+---
+
+### Open Questions
+
+List unresolved ambiguities that cannot be proven from this single example.
+
+Use bullet points. Do NOT speculate beyond the data.
+
+---
+
+## ❗ STRICT RULES
+
+- Do NOT invent rules
+- Do NOT generalize beyond this example
+- Do NOT explain reasoning outside the specified sections
+- If information is insufficient, state it explicitly in Open Questions
+'''
+
+WARMUP_UPDATE_PROMPT = '''You are a deterministic reasoning engine.
+- Follow instructions literally.
+- Do not infer unstated rules.
+- Do not remove information unless contradicted by new evidence.
+
+---
+
+## Current Understanding of the Transformation
+
+### Previous Transformation Description
+$$description$$
+
+### Current Mermaid Diagram
+```mermaid
+$$diagram$$
+```
+
+### Known Consistent Patterns
+$$patterns$$
+
+### Known Inconsistencies
+$$inconsistencies$$
+
+### Open Questions
+$$questions$$
+
+---
+
+## Previously Analyzed Examples (Reference)
+
+$$previous_examples$$
+
+---
+
+## NEW Example to Analyze (Example #$$example_num$$)
+
+**Input:**
+$$input$$
+
+**Output:**
+$$output$$
+
+---
+
+## REQUIRED RESPONSE FORMAT
+
+Respond using ONLY the following sections.
+- Do NOT change section names.
+- Do NOT reorder sections.
+- Do NOT add extra sections.
+
+---
+
+### Transformation Description
+
+Update the transformation description so it is consistent with ALL examples seen so far.
+
+**You MUST:**
+- Explicitly state which rules remain valid
+- Explicitly state which rules were refined or corrected
+- Explicitly state which rules are now invalid
+- Base all changes ONLY on observable evidence
+- Use implementation-ready language
+- If a rule cannot yet be resolved, state this clearly
+
+---
+
+### Mermaid Diagram
+
+**UPDATE the previous diagram** to reflect the current best understanding after analyzing the new example.
+
+**The updated diagram MUST:**
+- Keep the same structure: subgraphs for Detection, Classification/Analysis, Transformation, Output
+- Use `flowchart TD` format
+- Use diamond-shaped decision nodes `{condition?}` for ALL conditional logic
+- Include explicit value/color mappings
+- Include explicit spatial or shape-based conditions
+- Include a subgraph for `⚠️ Inconsistencies` (update with any new conflicts)
+- Include a subgraph for `❓ Open Questions` (update: remove resolved, add new)
+
+**Rules:**
+- Build upon the previous diagram - do NOT start from scratch
+- Add new logic discovered from the new example
+- Contradicted rules must connect to ⚠️ Inconsistencies with dashed arrows `-.->`
+- Uncertain decisions must connect to ❓ Open Questions with dashed arrows
+- Remove logic ONLY if explicitly contradicted by new evidence
+
+---
+
+### Consistent Patterns
+
+**UPDATE the previous patterns list** based on the new example.
+
+**You MUST:**
+- Keep patterns that still hold across ALL examples
+- Remove patterns that are contradicted by the new example
+- Add new patterns discovered from the new example
+- Be specific (colors, shapes, coordinates, relationships)
+- Use bullet points
+
+---
+
+### Inconsistencies
+
+**UPDATE the previous inconsistencies list** based on the new example.
+
+**You MUST:**
+- Keep unresolved inconsistencies from before
+- Remove inconsistencies that are now resolved
+- Add new contradictions discovered from the new example
+- For each: state which rule is affected, which examples conflict, why
+
+If none exist, write: `None observed.`
+
+---
+
+### Open Questions
+
+**UPDATE the previous open questions list** based on the new example.
+
+**You MUST:**
+- Remove questions that are now answered by the new example
+- Keep questions that remain unresolved
+- Add new questions raised by the new example
+- Use bullet points
+
+Do NOT restate inconsistencies here.
+
+---
+
+## ❗ STRICT RULES
+
+- Do NOT invent new rules without evidence
+- Do NOT smooth over contradictions
+- Do NOT generalize beyond observed data
+- Prefer uncertainty over incorrect certainty
+'''

@@ -59,3 +59,35 @@ def build_kaggle_two_attempts(results: list[ARCAGIResult], test_in: List[List[Li
         out.append({"attempt_1": attempts[0], "attempt_2": attempts[1]})
 
     return out
+
+
+def extract_codes(results: list[ARCAGIResult]) -> dict:
+    """
+    Extract the generated code from results.
+    Returns: {"attempt_1": code, "attempt_2": code, "iteration": int}
+    """
+    codes: List[str] = []
+    iterations: List[int] = []
+
+    for ar in results:
+        # Get code from the first test result (all test results use same code)
+        tr = ar.get("results", [])
+        if tr:
+            code = tr[0].get("code", "")
+            if code and code not in codes:
+                codes.append(code)
+                iterations.append(ar.get("iteration", 0))
+                if len(codes) == 2:
+                    break
+
+    # Pad if fewer than 2 codes
+    while len(codes) < 2:
+        codes.append("")
+        iterations.append(0)
+
+    return {
+        "attempt_1": codes[0],
+        "attempt_2": codes[1],
+        "iteration_1": iterations[0],
+        "iteration_2": iterations[1],
+    }

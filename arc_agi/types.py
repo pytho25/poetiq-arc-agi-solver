@@ -10,6 +10,8 @@ Models = Literal[
     "anthropic/claude-haiku-4-5",
     "gemini/gemini-2.5-pro",
     "gemini/gemini-3-pro-preview",
+    "hosted_vllm/mistralai/Devstral-Small-2-24B-Instruct-2512",
+    "openrouter/mistralai/devstral-small-2505",
 ]
 
 

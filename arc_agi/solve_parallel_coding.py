@@ -14,6 +14,8 @@ async def solve_parallel_coding(
     test_in: list[list[list[int]]],
     expert_configs: list[ExpertConfig],
     problem_id: str | None = None,
+    verbose: bool = False,
+    logs_dir: str | None = None,
 ) -> list[ARCAGIResult]:
     """
     Run multiple coding experts in parallel, group by identical test outputs, then rank.
@@ -32,6 +34,9 @@ async def solve_parallel_coding(
         # seed, assuming the configs all start with an identical seed.
         cfg["seed"] += it * cfg["max_iterations"]
 
+    if verbose:
+        print(f"  [PARALLEL] Running {len(expert_configs)} expert(s)")
+
     # Solve concurrently
     tasks = [
         asyncio.create_task(
@@ -41,6 +46,8 @@ async def solve_parallel_coding(
                 test_in=test_in,
                 config=cfg,
                 problem_id=problem_id,
+                verbose=verbose,
+                logs_dir=logs_dir,
             )
         )
         for cfg in expert_configs

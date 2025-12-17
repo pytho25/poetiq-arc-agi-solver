@@ -1,13 +1,256 @@
 import json
+import os
 import re
 import string
+from datetime import datetime
 from typing import Any, Optional
 
 import numpy as np
 
 from arc_agi.llm import llm
+from arc_agi.prompts import WARMUP_EXPLAIN_PROMPT, WARMUP_UPDATE_PROMPT
 from arc_agi.sandbox import run
 from arc_agi.types import ARCAGIResult, ARCAGISolution, ExpertConfig, RunResult
+
+
+def _extract_section(response: str, section_name: str) -> str:
+    """Extract a section from LLM response by header name."""
+    # Look for ## Section Name followed by content until next ## or end
+    pattern = rf'##\s*{re.escape(section_name)}\s*\n([\s\S]*?)(?=\n##|\Z)'
+    match = re.search(pattern, response, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _extract_mermaid_diagram(response: str) -> str:
+    """Extract mermaid diagram from LLM response."""
+    # Look for ```mermaid ... ``` block
+    pattern = r'```mermaid\s*([\s\S]*?)```'
+    match = re.search(pattern, response)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+class WarmupContext:
+    """Holds the accumulated context from warmup phase."""
+    def __init__(self):
+        self.description: str = ""
+        self.diagram: str = ""
+        self.patterns: str = "- None identified yet"
+        self.inconsistencies: str = "- None identified yet"
+        self.questions: str = "- None yet"
+        self.previous_examples: list[tuple[str, str]] = []  # List of (input_str, output_str)
+
+    def add_example(self, input_str: str, output_str: str):
+        """Add an example to the cumulative list."""
+        self.previous_examples.append((input_str, output_str))
+
+    def get_previous_examples_str(self) -> str:
+        """Format previous examples as a string for the prompt."""
+        if not self.previous_examples:
+            return "No previous examples yet."
+
+        parts = []
+        for idx, (inp, out) in enumerate(self.previous_examples, 1):
+            parts.append(f"**Example {idx}:**\n\n**Input:**\n{inp}\n\n**Output:**\n{out}")
+        return "\n\n---\n\n".join(parts)
+
+    def update_from_response(self, response: str):
+        """Update context from LLM response."""
+        desc = _extract_section(response, "Transformation Description")
+        if desc:
+            self.description = desc
+
+        diagram = _extract_mermaid_diagram(response)
+        if diagram:
+            self.diagram = diagram
+
+        patterns = _extract_section(response, "Consistent Patterns")
+        if patterns:
+            self.patterns = patterns
+
+        inconsistencies = _extract_section(response, "Inconsistencies")
+        if inconsistencies:
+            self.inconsistencies = inconsistencies
+
+        questions = _extract_section(response, "Open Questions")
+        if questions:
+            self.questions = questions
+
+    def __str__(self) -> str:
+        return f"""## Transformation Description
+{self.description}
+
+## Mermaid Diagram
+```mermaid
+{self.diagram}
+```
+
+## Consistent Patterns
+{self.patterns}
+
+## Inconsistencies
+{self.inconsistencies}
+
+## Open Questions
+{self.questions}"""
+
+
+async def _warmup_phase(
+    train_in: list[list[list[int]]],
+    train_out: list[list[list[int]]],
+    llm_model: str,
+    temperature: float,
+    request_timeout: int | None,
+    problem_id: str | None = None,
+    verbose: bool = False,
+    logs_dir: str | None = None,
+) -> tuple[WarmupContext, int, int]:
+    """
+    Run warmup phase to help LLM understand the puzzle through progressive examples.
+
+    Returns:
+        tuple of (WarmupContext, total_prompt_tokens, total_completion_tokens)
+    """
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    context = WarmupContext()
+    warmup_logs: list[dict] = []
+
+    num_examples = len(train_in)
+
+    for i in range(num_examples):
+        input_str = _example_to_diagram_python_list(train_in[i])
+        output_str = _example_to_diagram_python_list(train_out[i])
+
+        if i == 0:
+            # First example: explain transformations and create initial understanding
+            if verbose:
+                print(f"    [WARMUP 1/{num_examples}] Analyzing first example")
+
+            prompt = WARMUP_EXPLAIN_PROMPT.replace("$$input$$", input_str).replace("$$output$$", output_str)
+
+            if verbose:
+                print(f"\n{'='*40} WARMUP PROMPT {'='*40}")
+                print(prompt)
+                print(f"{'='*40} END WARMUP PROMPT {'='*40}\n")
+
+            try:
+                response, _, _, _, prompt_tokens, completion_tokens = await llm(
+                    llm_model,
+                    message=prompt,
+                    temperature=temperature,
+                    request_timeout=request_timeout,
+                    max_remaining_time=None,
+                    max_remaining_timeouts=None,
+                    problem_id=problem_id,
+                    retries=3,
+                )
+                total_prompt_tokens += prompt_tokens
+                total_completion_tokens += completion_tokens
+                context.update_from_response(response)
+                # Add this example to the cumulative list for future iterations
+                context.add_example(input_str, output_str)
+
+                # Log warmup iteration
+                warmup_logs.append({
+                    "step": i + 1,
+                    "type": "initial_analysis",
+                    "prompt": prompt,
+                    "response": response,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                })
+
+                if verbose:
+                    print(f"      Tokens: {prompt_tokens} prompt + {completion_tokens} completion")
+                    print(f"\n{'='*40} WARMUP RESPONSE {'='*40}")
+                    print(response)
+                    print(f"{'='*40} END WARMUP RESPONSE {'='*40}\n")
+            except Exception as e:
+                if verbose:
+                    print(f"      Warmup error: {e}")
+                # Still add example even if analysis failed, so we have the data
+                context.add_example(input_str, output_str)
+
+        else:
+            # Subsequent examples: update understanding with new example
+            if verbose:
+                print(f"    [WARMUP {i+1}/{num_examples}] Updating with example {i+1}")
+
+            # Provide defaults if extraction failed
+            if not context.diagram:
+                context.diagram = "flowchart TD\n    A[Input] --> B[Transform] --> C[Output]"
+            if not context.description:
+                context.description = "Unknown transformation"
+
+            prompt = (WARMUP_UPDATE_PROMPT
+                .replace("$$description$$", context.description)
+                .replace("$$diagram$$", context.diagram)
+                .replace("$$patterns$$", context.patterns)
+                .replace("$$inconsistencies$$", context.inconsistencies)
+                .replace("$$questions$$", context.questions)
+                .replace("$$previous_examples$$", context.get_previous_examples_str())
+                .replace("$$example_num$$", str(i + 1))
+                .replace("$$input$$", input_str)
+                .replace("$$output$$", output_str))
+
+            if verbose:
+                print(f"\n{'='*40} WARMUP PROMPT {'='*40}")
+                print(prompt)
+                print(f"{'='*40} END WARMUP PROMPT {'='*40}\n")
+
+            try:
+                response, _, _, _, prompt_tokens, completion_tokens = await llm(
+                    llm_model,
+                    message=prompt,
+                    temperature=temperature,
+                    request_timeout=request_timeout,
+                    max_remaining_time=None,
+                    max_remaining_timeouts=None,
+                    problem_id=problem_id,
+                    retries=3,
+                )
+                total_prompt_tokens += prompt_tokens
+                total_completion_tokens += completion_tokens
+                context.update_from_response(response)
+                # Add this example to the cumulative list for future iterations
+                context.add_example(input_str, output_str)
+
+                # Log warmup iteration
+                warmup_logs.append({
+                    "step": i + 1,
+                    "type": "update_analysis",
+                    "prompt": prompt,
+                    "response": response,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                })
+
+                if verbose:
+                    print(f"      Tokens: {prompt_tokens} prompt + {completion_tokens} completion")
+                    print(f"\n{'='*40} WARMUP RESPONSE {'='*40}")
+                    print(response)
+                    print(f"{'='*40} END WARMUP RESPONSE {'='*40}\n")
+            except Exception as e:
+                if verbose:
+                    print(f"      Warmup update error: {e}")
+                # Still add example even if analysis failed, so we have the data
+                context.add_example(input_str, output_str)
+
+    # Write warmup log file
+    if logs_dir and problem_id and warmup_logs:
+        _write_warmup_log(logs_dir, problem_id, warmup_logs, context, total_prompt_tokens, total_completion_tokens)
+
+    if verbose:
+        print(f"    [WARMUP COMPLETE] Total: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens")
+        print(f"\n{'='*40} FINAL WARMUP CONTEXT {'='*40}")
+        print(str(context))
+        print(f"{'='*40} END WARMUP CONTEXT {'='*40}\n")
+
+    return context, total_prompt_tokens, total_completion_tokens
 
 
 async def solve_coding(
@@ -17,6 +260,8 @@ async def solve_coding(
     test_in: list[list[list[int]]],
     config: ExpertConfig,
     problem_id: str | None = None,
+    verbose: bool = False,
+    logs_dir: str | None = None,
 ) -> ARCAGIResult:
     solver_prompt = config["solver_prompt"]
     feedback_prompt = config["feedback_prompt"]
@@ -54,10 +299,59 @@ async def solve_coding(
     rng = np.random.default_rng(seed)
     solutions: list[ARCAGISolution] = []
 
+    # Iteration logging
+    iteration_logs: list[dict] = []
+    start_time = datetime.now()
+
+    # Warmup phase: progressive understanding through examples
+    if verbose:
+        print(f"    [WARMUP START] {problem_id} - {len(train_in)} training examples")
+
+    warmup_context, warmup_prompt_tokens, warmup_completion_tokens = await _warmup_phase(
+        train_in=train_in,
+        train_out=train_out,
+        llm_model=llm_model,
+        temperature=solver_temperature,
+        request_timeout=request_timeout,
+        problem_id=problem_id,
+        verbose=verbose,
+        logs_dir=logs_dir,
+    )
+    total_prompt_tokens += warmup_prompt_tokens
+    total_completion_tokens += warmup_completion_tokens
+
     for it in range(max_iterations):
+        if verbose:
+            print(f"    [ITER {it+1}/{max_iterations}] {problem_id}")
+
         example = _make_example(train_in, train_out, test_in)
         problem_str = format_problem(example, shuffle_examples, seed + it)
+
+        # Build base prompt
         message = _build_prompt(solver_prompt, problem=problem_str)
+
+        # Add warmup context at the end of the prompt
+        if warmup_context and warmup_context.description:
+            warmup_context_str = f"""
+
+---
+
+## PRE-ANALYSIS: Understanding Derived from Studying the Examples
+
+The following analysis was derived from systematically studying each training example. Use this to guide your solution.
+
+{str(warmup_context)}
+
+### Guidelines for Using This Analysis
+- The **Transformation Description** captures the current best understanding of the rule
+- The **Mermaid Diagram** shows the algorithm flow with decision points
+- **Consistent Patterns** are observations that held across all examples
+- **Inconsistencies** highlight conflicts that need special handling in your code
+- **Open Questions** are ambiguities your solution should account for
+
+Your code MUST handle all identified inconsistencies and edge cases.
+"""
+            message = message + warmup_context_str
 
         selected = []
         if solutions:
@@ -69,6 +363,14 @@ async def solve_coding(
                 selected, max_examples=max_solutions, improving_order=improving_order
             )
             message += "\n\n" + _build_prompt(feedback_prompt, feedback=examples_block)
+
+        if verbose:
+            print(f"      Prompt length: {len(message)} chars (~{len(message)//4} tokens)")
+            if selected:
+                print(f"      Including {len(selected)} previous solution(s) as feedback")
+            print(f"\n{'='*40} PROMPT {'='*40}")
+            print(message)
+            print(f"{'='*40} END PROMPT {'='*40}\n")
 
         try:
             response, duration, max_total_time, max_total_timeouts, prompt_tokens, completion_tokens = await llm(
@@ -83,7 +385,16 @@ async def solve_coding(
             )
             total_prompt_tokens += prompt_tokens
             total_completion_tokens += completion_tokens
+
+            if verbose:
+                print(f"      LLM response: {prompt_tokens} prompt + {completion_tokens} completion tokens ({duration:.1f}s)")
+                print(f"\n{'='*40} RESPONSE {'='*40}")
+                print(response)
+                print(f"{'='*40} END RESPONSE {'='*40}\n")
+
         except Exception as e:
+            if verbose:
+                print(f"      LLM error: {e}")
             if "Exceeded timeouts allotted to the request" in str(e) or "Exceeded time allotted to the request" in str(e):
                 # Exceeded max_remaining_timeouts or max_remaining_time
                 print("Exiting early due to exceeding allotted time or timeouts on problem", problem_id)
@@ -93,7 +404,13 @@ async def solve_coding(
 
         code = _parse_code_from_llm(response)
         if not code:
+            if verbose:
+                print(f"      No code block found in response")
             continue
+
+        if verbose:
+            code_lines = code.strip().split('\n')
+            print(f"      Generated code: {len(code_lines)} lines")
 
         train_res, test_res = await _eval_on_train_and_test(
             code, train_in, train_out, test_in, timeout_s=timeout_sandbox
@@ -101,7 +418,35 @@ async def solve_coding(
 
         last_train, last_test = train_res, test_res
 
+        train_passed = sum(1 for r in train_res if r["success"])
+        if verbose:
+            print(f"      Train results: {train_passed}/{len(train_res)} passed")
+
         if all(r["success"] for r in train_res):
+            if verbose:
+                print(f"      SUCCESS! All train examples passed at iteration {it+1}")
+
+            # Log the successful iteration
+            if logs_dir and problem_id and code:
+                code_filename = f"{problem_id}_iter_{it + 1}.py"
+                with open(os.path.join(logs_dir, code_filename), "w", encoding="utf-8") as f:
+                    f.write(code)
+                iteration_logs.append({
+                    "iteration": it + 1,
+                    "timestamp": datetime.now(),
+                    "prompt": message,
+                    "prompt_tokens": prompt_tokens,
+                    "response": response,
+                    "completion_tokens": completion_tokens,
+                    "duration": duration,
+                    "code_file": code_filename,
+                    "train_results": train_res,
+                    "feedback": "All examples passed correctly.",
+                    "score": 1.0,
+                })
+                _write_challenge_log(logs_dir, problem_id, iteration_logs, start_time,
+                                     success=True, final_score=1.0)
+
             return ARCAGIResult(
                 train_results=train_res,
                 results=test_res,
@@ -113,6 +458,28 @@ async def solve_coding(
         feedback, score = _build_feedback(train_res, train_in, train_out)
         solutions.append(ARCAGISolution(code=code, feedback=feedback, score=score))
 
+        # Log this iteration
+        if logs_dir and problem_id and code:
+            code_filename = f"{problem_id}_iter_{it + 1}.py"
+            with open(os.path.join(logs_dir, code_filename), "w", encoding="utf-8") as f:
+                f.write(code)
+            iteration_logs.append({
+                "iteration": it + 1,
+                "timestamp": datetime.now(),
+                "prompt": message,
+                "prompt_tokens": prompt_tokens,
+                "response": response,
+                "completion_tokens": completion_tokens,
+                "duration": duration,
+                "code_file": code_filename,
+                "train_results": train_res,
+                "feedback": feedback,
+                "score": score,
+            })
+
+        if verbose:
+            print(f"      Score: {score:.2f} (best so far: {max(best_train_score, score):.2f})")
+
         if score >= best_train_score:
             best_train_score = score
             best_result = ARCAGIResult(
@@ -122,6 +489,12 @@ async def solve_coding(
                 prompt_tokens=None,
                 completion_tokens=None,
             )
+
+    # Write final log file if we exhausted iterations without success
+    if logs_dir and problem_id and iteration_logs:
+        final_score = best_train_score if best_train_score >= 0 else 0.0
+        _write_challenge_log(logs_dir, problem_id, iteration_logs, start_time,
+                             success=False, final_score=final_score)
 
     if return_best and best_result is not None:
         best_result['prompt_tokens'] = total_prompt_tokens
@@ -259,24 +632,39 @@ def format_problem(
         example_str += f"""
 Example #{example_num}
 Input:
-<Diagram>
-{_example_to_diagram(example["input"])}
-</Diagram>
+{_example_to_diagram_python_list(example["input"])}
 
 Output:
-<Diagram>
-{_example_to_diagram(example["output"])}
-</Diagram>
+{_example_to_diagram_python_list(example["output"])}
 """
+        # Old diagram format:
+        # example_str += f"""
+# Example #{example_num}
+# Input:
+# <Diagram>
+# {_example_to_diagram(example["input"])}
+# </Diagram>
+#
+# Output:
+# <Diagram>
+# {_example_to_diagram(example["output"])}
+# </Diagram>
+# """
 
     for challenge_num, challenge in enumerate(test, start=1):
         challenge_str += f"""
 Challenge #{challenge_num}
 Input:
-<Diagram>
-{_example_to_diagram(challenge["input"])}
-</Diagram>
+{_example_to_diagram_python_list(challenge["input"])}
 """
+        # Old diagram format:
+        # challenge_str += f"""
+# Challenge #{challenge_num}
+# Input:
+# <Diagram>
+# {_example_to_diagram(challenge["input"])}
+# </Diagram>
+# """
 
     return example_str + challenge_str
 
@@ -288,6 +676,17 @@ def _example_to_diagram(example: list[list[int]] | np.ndarray) -> str:
         row_str = " ".join([str(col) for col in row]) + "\n"
         diagram += row_str
     return diagram[:-1]  # Strip final \n
+
+
+def _example_to_diagram_python_list(example: list[list[int]] | np.ndarray) -> str:
+    """Converts an ARC-AGI example to a nicely formatted Python list representation."""
+    lines = ["["]
+    for i, row in enumerate(example):
+        row_list = list(row) if hasattr(row, '__iter__') else row
+        comma = "," if i < len(example) - 1 else ""
+        lines.append(f"    {list(row_list)}{comma}")
+    lines.append("]")
+    return "\n".join(lines)
 
 
 async def _eval_on_train_and_test(
@@ -407,3 +806,118 @@ def _build_feedback(
         else 0.0
     )
     return full_feedback, mean_score
+
+
+def _write_warmup_log(
+    logs_dir: str,
+    problem_id: str,
+    warmup_logs: list[dict],
+    final_context: 'WarmupContext',
+    total_prompt_tokens: int,
+    total_completion_tokens: int,
+) -> None:
+    """Write warmup phase log to TEXT file."""
+    log_file = os.path.join(logs_dir, f"{problem_id}_warmup.txt")
+
+    with open(log_file, "w", encoding="utf-8") as f:
+        # Header
+        f.write("=" * 80 + "\n")
+        f.write(f"WARMUP PHASE: {problem_id}\n")
+        f.write(f"Total Steps: {len(warmup_logs)}\n")
+        f.write(f"Total Tokens: {total_prompt_tokens} prompt + {total_completion_tokens} completion\n")
+        f.write("=" * 80 + "\n\n")
+
+        # Each warmup step
+        for log in warmup_logs:
+            f.write("#" * 80 + "\n")
+            f.write(f"WARMUP STEP {log['step']} ({log['type']})\n")
+            f.write("#" * 80 + "\n\n")
+
+            # Prompt
+            f.write("-" * 80 + "\n")
+            f.write(f"PROMPT ({log['prompt_tokens']} tokens)\n")
+            f.write("-" * 80 + "\n")
+            f.write(log['prompt'] + "\n\n")
+
+            # Response
+            f.write("-" * 80 + "\n")
+            f.write(f"RESPONSE ({log['completion_tokens']} tokens)\n")
+            f.write("-" * 80 + "\n")
+            f.write(log['response'] + "\n\n\n")
+
+        # Final context summary
+        f.write("=" * 80 + "\n")
+        f.write("FINAL WARMUP CONTEXT\n")
+        f.write("=" * 80 + "\n")
+        f.write(str(final_context) + "\n")
+        f.write("=" * 80 + "\n")
+
+
+def _write_challenge_log(
+    logs_dir: str,
+    problem_id: str,
+    iterations: list[dict],
+    start_time: datetime,
+    success: bool,
+    final_score: float,
+) -> None:
+    """Write complete challenge log to single TEXT file."""
+    log_file = os.path.join(logs_dir, f"{problem_id}.txt")
+
+    with open(log_file, "w", encoding="utf-8") as f:
+        # Header
+        f.write("=" * 80 + "\n")
+        f.write(f"CHALLENGE: {problem_id}\n")
+        f.write(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 80 + "\n\n")
+
+        # Each iteration
+        for it in iterations:
+            f.write("#" * 80 + "\n")
+            f.write(f"ITERATION {it['iteration']}\n")
+            f.write("#" * 80 + "\n")
+            f.write(f"Timestamp: {it['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Code file: {it['code_file']}\n\n")
+
+            # Prompt
+            f.write("-" * 80 + "\n")
+            f.write(f"PROMPT ({it['prompt_tokens']} tokens)\n")
+            f.write("-" * 80 + "\n")
+            f.write(it['prompt'] + "\n\n")
+
+            # Response
+            f.write("-" * 80 + "\n")
+            f.write(f"LLM RESPONSE ({it['completion_tokens']} tokens, {it['duration']:.1f}s)\n")
+            f.write("-" * 80 + "\n")
+            f.write(it['response'] + "\n\n")
+
+            # Train results
+            f.write("-" * 80 + "\n")
+            f.write("TRAIN RESULTS\n")
+            f.write("-" * 80 + "\n")
+            for i, r in enumerate(it['train_results']):
+                status = "✓ PASSED" if r['success'] else "✗ FAILED"
+                score_val = r.get('soft_score', 0.0)
+                f.write(f"Example #{i+1}: {status} (score: {score_val:.2f})\n")
+                if r.get('output'):
+                    output_str = str(r['output'])
+                    f.write(f"  Output: {output_str}\n")
+                if r.get('error'):
+                    f.write(f"  Error: {r['error']}\n")
+            f.write(f"\nOverall Score: {it['score']:.2f}\n\n")
+
+            # Feedback
+            f.write("-" * 80 + "\n")
+            f.write("FEEDBACK\n")
+            f.write("-" * 80 + "\n")
+            f.write(it['feedback'] + "\n\n\n")
+
+        # Summary
+        f.write("=" * 80 + "\n")
+        f.write("SUMMARY\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total Iterations: {len(iterations)}\n")
+        f.write(f"Final Result: {'SUCCESS' if success else 'FAILED'}\n")
+        f.write(f"Final Score: {final_score:.2f}\n")
+        f.write("=" * 80 + "\n")

@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -10,11 +11,20 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from arc_agi.config import CONFIG_LIST
-from arc_agi.io import build_kaggle_two_attempts
+from arc_agi.io import build_kaggle_two_attempts, extract_codes
 from arc_agi.scoring import score_task
 from arc_agi.solve import solve
 
 load_dotenv()
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="ARC-AGI Solver")
+parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+parser.add_argument("--log", "-L", action="store_true", help="Enable detailed iteration logging (full prompts/responses)")
+parser.add_argument("--puzzle", "-p", nargs="+", help="Specific puzzle ID(s) to run (e.g., -p b7999b51 or -p id1 id2)")
+args = parser.parse_args()
+VERBOSE = args.verbose
+LOG_ENABLED = args.log
 
 
 # time the run started, so multiple runs don't collide
@@ -27,39 +37,62 @@ DATA_SOLUTIONS = os.path.join(os.path.dirname(__file__), "data", "arc-prize-2024
 # where to write outputs
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 OUTPUT = os.path.join(OUTPUT_DIR, f"submission_{TIMESTAMP}.json")
+LOGS_DIR = os.path.join(OUTPUT_DIR, f"logs_{TIMESTAMP}") if LOG_ENABLED else None
 
 # number of problems (None = all)
 NUM_PROBLEMS = None
-# select particular problems
-SELECTED_PROBLEMS = [] # e.g. ['b7999b51']
+# select particular problems (command line overrides this)
+SELECTED_PROBLEMS = args.puzzle if args.puzzle else []  # e.g. ['b7999b51']
+# max concurrent problems (for local LLM servers)
+MAX_CONCURRENT = 3
 
 
-async def _eval_task_data(task_id: str, task: dict) -> tuple[str, Optional[list[dict]], Optional[dict], Optional[str], float]:
+async def _eval_task_data(task_id: str, task: dict, semaphore: asyncio.Semaphore, logs_dir: str | None = None) -> tuple[str, Optional[list[dict]], Optional[dict], Optional[dict], Optional[str], float]:
     """
-    Returns: (task_id, kaggle_preds | None on error, tokens | None on error, error, elapsed_seconds)
+    Returns: (task_id, kaggle_preds | None on error, tokens | None on error, codes | None on error, error, elapsed_seconds)
     """
-    start = time.time()
-    try:
-        train = task.get("train", [])
-        test = task.get("test", [])
-        train_in = [ex["input"] for ex in train]
-        train_out = [ex["output"] for ex in train]
-        test_in = [ex["input"] for ex in test]
+    async with semaphore:
+        start = time.time()
+        if VERBOSE:
+            print(f"\n{'='*60}")
+            print(f"[START] Problem: {task_id}")
+            train = task.get("train", [])
+            test = task.get("test", [])
+            print(f"  Train examples: {len(train)}")
+            print(f"  Test cases: {len(test)}")
+            for i, ex in enumerate(train):
+                in_shape = f"{len(ex['input'])}x{len(ex['input'][0]) if ex['input'] else 0}"
+                out_shape = f"{len(ex['output'])}x{len(ex['output'][0]) if ex['output'] else 0}"
+                print(f"  Train #{i+1}: input {in_shape} -> output {out_shape}")
+            print(f"{'='*60}")
 
-        results = await solve(train_in, train_out, test_in, problem_id=task_id)
-        kaggle_preds = build_kaggle_two_attempts(results, test_in)
+        try:
+            train = task.get("train", [])
+            test = task.get("test", [])
+            train_in = [ex["input"] for ex in train]
+            train_out = [ex["output"] for ex in train]
+            test_in = [ex["input"] for ex in test]
 
-        prompt_tokens = sum(r['prompt_tokens'] or 0 for r in results if r)
-        completion_tokens = sum(r['completion_tokens'] or 0 for r in results if r)
-        tokens = {
-            "prompt": prompt_tokens,
-            "completion": completion_tokens,
-            "total": prompt_tokens + completion_tokens
-        }
+            results = await solve(train_in, train_out, test_in, problem_id=task_id, verbose=VERBOSE, logs_dir=logs_dir)
+            kaggle_preds = build_kaggle_two_attempts(results, test_in)
+            codes = extract_codes(results)
 
-        return task_id, kaggle_preds, tokens, None, time.time() - start
-    except Exception:
-        return task_id, None, None, traceback.format_exc(), time.time() - start
+            prompt_tokens = sum(r['prompt_tokens'] or 0 for r in results if r)
+            completion_tokens = sum(r['completion_tokens'] or 0 for r in results if r)
+            tokens = {
+                "prompt": prompt_tokens,
+                "completion": completion_tokens,
+                "total": prompt_tokens + completion_tokens
+            }
+
+            if VERBOSE:
+                print(f"\n[DONE] Problem: {task_id}")
+                print(f"  Tokens: {tokens['prompt']} prompt + {tokens['completion']} completion = {tokens['total']} total")
+                print(f"  Time: {time.time() - start:.1f}s")
+
+            return task_id, kaggle_preds, tokens, codes, None, time.time() - start
+        except Exception:
+            return task_id, None, None, None, traceback.format_exc(), time.time() - start
 
 
 async def main():
@@ -71,6 +104,11 @@ async def main():
     resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
 
     os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
+
+    # Create logs directory if logging is enabled
+    if LOGS_DIR:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        print(f"Logging iterations to: {LOGS_DIR}")
 
     print(f"Writing config_{TIMESTAMP}.json to output directory...")
     with open(os.path.join(OUTPUT_DIR, f"config_{TIMESTAMP}.json"), "w", encoding="utf-8") as f:
@@ -98,12 +136,21 @@ async def main():
 
 
     print(f"Running {len(items)} problems from {DATA_CHALLENGES}...")
+    print(f"Max concurrent: {MAX_CONCURRENT}")
+    print(f"Verbose: {VERBOSE}")
+    print(f"Iteration logging: {'enabled' if LOG_ENABLED else 'disabled'}")
     print("Scoring:", "enabled" if solutions_blob is not None else "disabled (no solutions)")
+    if VERBOSE:
+        print(f"\nConfig: {CONFIG_LIST[0]['llm_id']}")
+        print(f"  Temperature: {CONFIG_LIST[0]['solver_temperature']}")
+        print(f"  Max iterations: {CONFIG_LIST[0]['max_iterations']}")
+        print(f"  Num experts: {len(CONFIG_LIST)}")
 
     start = time.time()
 
     submission: dict[str, list[dict]] = {}
     tokens_data: dict[str, dict] = {}
+    codes_data: dict[str, dict] = {}
 
     # running scores only if solutions available
     per_task_scores: dict[str, float] = {}
@@ -111,10 +158,11 @@ async def main():
     correct = 0.0
     incorrect = 0.0
 
-    tasks = [asyncio.create_task(_eval_task_data(task_id, task)) for task_id, task in items]
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    tasks = [asyncio.create_task(_eval_task_data(task_id, task, semaphore, LOGS_DIR)) for task_id, task in items]
 
     for coro in asyncio.as_completed(tasks):
-        task_id, preds, tokens, err, elapsed = await coro
+        task_id, preds, tokens, codes, err, elapsed = await coro
 
         if err is not None or preds is None:
             print(f"! {task_id} (error in {round(elapsed)}s)\n{err}")
@@ -123,6 +171,26 @@ async def main():
             submission[task_id] = preds
             if tokens:
                 tokens_data[task_id] = tokens
+            if codes:
+                # Save code to separate files and store references
+                codes_dir = os.path.join(OUTPUT_DIR, f"codes_{TIMESTAMP}")
+                os.makedirs(codes_dir, exist_ok=True)
+
+                code_refs = {}
+                for attempt_key in ["attempt_1", "attempt_2"]:
+                    code = codes.get(attempt_key, "")
+                    if code:
+                        filename = f"{task_id}_{attempt_key}.py"
+                        filepath = os.path.join(codes_dir, filename)
+                        with open(filepath, "w", encoding="utf-8") as cf:
+                            cf.write(code)
+                        code_refs[attempt_key] = filepath
+                    else:
+                        code_refs[attempt_key] = None
+
+                code_refs["iteration_1"] = codes.get("iteration_1", 0)
+                code_refs["iteration_2"] = codes.get("iteration_2", 0)
+                codes_data[task_id] = code_refs
 
             # running scores if solutions available
             if solutions_blob is not None and task_id in solutions_blob:
@@ -143,6 +211,8 @@ async def main():
                 json.dump(submission, f)
             with open(os.path.join(OUTPUT_DIR, f"tokens_{TIMESTAMP}.json"), "w", encoding="utf-8") as f:
                 json.dump(tokens_data, f)
+            with open(os.path.join(OUTPUT_DIR, f"codes_{TIMESTAMP}.json"), "w", encoding="utf-8") as f:
+                json.dump(codes_data, f, indent=2)
         except Exception as e:
             print(f"WARNING: Failed to write partial output to {OUTPUT}: {e}")
 
@@ -168,6 +238,9 @@ async def main():
         with open(os.path.join(OUTPUT_DIR, f"tokens_{TIMESTAMP}.json"), "w", encoding="utf-8") as f:
             json.dump(tokens_data, f)
         print(f"Wrote token usage to: {os.path.join(OUTPUT_DIR, f'tokens_{TIMESTAMP}.json')}")
+        with open(os.path.join(OUTPUT_DIR, f"codes_{TIMESTAMP}.json"), "w", encoding="utf-8") as f:
+            json.dump(codes_data, f, indent=2)
+        print(f"Wrote generated code to: {os.path.join(OUTPUT_DIR, f'codes_{TIMESTAMP}.json')}")
     except Exception as e:
         print(f"ERROR: Final write to {OUTPUT} failed: {e}")
 

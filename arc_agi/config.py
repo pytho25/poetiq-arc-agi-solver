@@ -14,7 +14,7 @@ CONFIG_LIST: list[ExpertConfig] = [
     'solver_prompt': SOLVER_PROMPT_1,
     'feedback_prompt': FEEDBACK_PROMPT,
     # LLM parameters
-    'llm_id': 'gemini/gemini-3-pro-preview',
+    'llm_id': 'openrouter/mistralai/devstral-small-2505',
     'solver_temperature': 1.0,
     'request_timeout': 60 * 60, # in seconds
     'max_total_timeouts': 15, # per problem per solver
